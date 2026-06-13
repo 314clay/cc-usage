@@ -20,6 +20,7 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 CODEX_DIR = HOME / ".codex" / "sessions"
 CODEX_AUTH = HOME / ".codex" / "auth.json"
 CACHE_FILE = HOME / ".cache" / "cc-usage" / "cache.json"
+CLAUDE_LIMITS_CACHE = HOME / ".cache" / "cc-usage" / "claude-limits.json"
 
 # Pricing per 1M tokens (USD): (input, output, cache_write, cache_read)
 # Keyed as "<provider>/<family>". For OpenAI we don't get a separate
@@ -277,10 +278,24 @@ def load_cache():
 
 def save_cache(files):
     CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CACHE_FILE.with_suffix(".tmp")
+    tmp = CACHE_FILE.with_name(f"{CACHE_FILE.name}.{os.getpid()}.tmp")
     with open(tmp, "w") as f:
         json.dump({"version": CACHE_VERSION, "files": files}, f)
     tmp.replace(CACHE_FILE)
+
+def save_claude_limits(payload):
+    CLAUDE_LIMITS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_LIMITS_CACHE.with_name(f"{CLAUDE_LIMITS_CACHE.name}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(CLAUDE_LIMITS_CACHE)
+
+def load_claude_limits():
+    try:
+        with open(CLAUDE_LIMITS_CACHE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 # ---- collection ----
 def collect_records(window_start_iso=None, debug=False, source="claude"):
@@ -816,13 +831,97 @@ def _latest_rate_limits(records):
             best = r
     return (best.get("rate_limits"), best) if best else (None, None)
 
+def _window_row(label, w, used_key="used_percentage"):
+    if not w:
+        return None
+    used = float(w.get(used_key) or 0.0)
+    resets_at = int(w.get("resets_at") or 0)
+    if resets_at:
+        now_ts = time.time()
+        delta = _fmt_reset_in(resets_at - now_ts)
+        local = datetime.fromtimestamp(resets_at, tz=timezone.utc).astimezone()
+        resets_str = f"{delta}  ({local.strftime('%a %H:%M')})"
+    else:
+        resets_str = "?"
+    return [label, pct_color(used), render_bar(used, width=22), resets_str], used, resets_at
+
+def cmd_capture_limits(args):
+    try:
+        obj = json.load(sys.stdin)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": f"invalid json: {e}"}))
+        return 1
+
+    rl = obj.get("rate_limits")
+    if not rl:
+        if args.json:
+            print(json.dumps({"ok": False, "error": "no rate_limits in stdin"}))
+        return 0
+
+    payload = {
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "session_id": obj.get("session_id"),
+        "transcript_path": obj.get("transcript_path"),
+        "model": obj.get("model"),
+        "rate_limits": rl,
+    }
+    save_claude_limits(payload)
+    if args.json:
+        print(json.dumps({"ok": True, "cache_file": str(CLAUDE_LIMITS_CACHE)}))
+    return 0
+
+def cmd_claude_limits(args):
+    data = load_claude_limits()
+    if not data:
+        if args.json:
+            return json.dumps({
+                "error": "no Claude rate-limit cache",
+                "hint": "pipe Claude Code status-line JSON into `cc-usage capture-limits`",
+            })
+        return ("(no Claude rate-limit cache found)\n"
+                + dim("hint: add `cc-usage capture-limits` to your Claude status-line script, then send one Claude message"))
+
+    rl = data.get("rate_limits") or {}
+    rows_data = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        row = _window_row(label, rl.get(key))
+        if row:
+            rows_data.append((key, row))
+
+    if args.json:
+        now_ts = time.time()
+        out = {
+            "captured_at": data.get("captured_at"),
+            "cache_file": str(CLAUDE_LIMITS_CACHE),
+            "session_id": data.get("session_id"),
+            "transcript_path": data.get("transcript_path"),
+            "model": data.get("model"),
+            "windows": {},
+        }
+        for key, (_row, used, resets_at) in rows_data:
+            out["windows"][key] = {
+                "used_percent": used,
+                "resets_at": resets_at,
+                "resets_in_seconds": int(max(0, resets_at - now_ts)) if resets_at else None,
+            }
+        return json.dumps(out, indent=2)
+
+    out = [bold("Claude Code subscription") + dim("  source=statusline cache")]
+    if rows_data:
+        rows = [r[1][0] for r in rows_data]
+        out.append(render_table(["window", "used", "bar", "resets in"], rows,
+                                aligns=["l", "r", "l", "l"]))
+    else:
+        out.append(dim("(no windows reported)"))
+    out.append(dim(f"captured: {data.get('captured_at') or '?'}"))
+    out.append(dim(f"cache: {CLAUDE_LIMITS_CACHE}"))
+    return "\n".join(out)
+
 def cmd_limits(args, records):
     src = getattr(args, "source", "claude")
     if src == "claude":
-        msg = "limits is Codex-only; rerun with --codex (Claude Code does not expose subscription windows locally)."
-        if args.json:
-            return json.dumps({"error": "claude source not supported", "hint": "use --codex"})
-        return msg
+        return cmd_claude_limits(args)
     rl, rec = _latest_rate_limits(records)
     if not rl:
         if args.json:
@@ -841,15 +940,11 @@ def cmd_limits(args, records):
         used = float(w.get("used_percent") or 0.0)
         wm = w.get("window_minutes")
         label = _fmt_window_label(wm) if wm else label_fallback
-        resets_at = int(w.get("resets_at") or 0)
-        if resets_at:
-            now_ts = time.time()
-            delta = _fmt_reset_in(resets_at - now_ts)
-            local = datetime.fromtimestamp(resets_at, tz=timezone.utc).astimezone()
-            resets_str = f"{delta}  ({local.strftime('%a %H:%M')})"
-        else:
-            resets_str = "?"
-        return [label, pct_color(used), render_bar(used, width=22), resets_str], used, wm, resets_at
+        base = globals()["_window_row"](label, w, used_key="used_percent")
+        if not base:
+            return None
+        row, _base_used, resets_at = base
+        return row, used, wm, resets_at
 
     rows_data = []
     for fb, w in (("primary", primary), ("secondary", secondary)):
@@ -890,6 +985,55 @@ def cmd_limits(args, records):
     out.append(dim(f"captured: {rec_ts}"))
     out.append(dim(f"source: {rec.get('file')}"))
     return "\n".join(out)
+
+def _latest_session_id(records):
+    latest = max(records, key=lambda r: r.get("ts") or "", default=None)
+    return latest.get("session") if latest else None
+
+def cmd_snapshot(args, _records=None):
+    """Machine-readable one-shot snapshot for dashboards.
+
+    Collect each backend once, then reuse those records for weekly totals,
+    current-session totals, and subscription-limit percentages. This is much
+    cheaper than a UI shelling out separately for `week`, `session`, and
+    `limits`.
+    """
+    window_iso = days_ago_start(7).astimezone(timezone.utc).isoformat()
+    claude_records, claude_files = collect_records(window_start_iso=window_iso, debug=args.debug, source="claude")
+    codex_records, codex_files = collect_records(window_start_iso=window_iso, debug=args.debug, source="codex")
+
+    def ns(source):
+        return argparse.Namespace(**{**vars(args), "json": True, "source": source, "id": None})
+
+    claude_args = ns("claude")
+    codex_args = ns("codex")
+    claude_sid = _latest_session_id(claude_records)
+    codex_sid = _latest_session_id(codex_records)
+
+    claude_session = {}
+    if claude_sid:
+        claude_session = json.loads(cmd_session(argparse.Namespace(**{**vars(claude_args), "id": claude_sid}), claude_records))
+    codex_session = {}
+    if codex_sid:
+        codex_session = json.loads(cmd_session(argparse.Namespace(**{**vars(codex_args), "id": codex_sid}), codex_records))
+
+    return json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "claude": {
+            "limits": json.loads(cmd_claude_limits(claude_args)),
+            "week": json.loads(cmd_week(claude_args, claude_records)),
+            "session": claude_session,
+            "scanned_files": claude_files,
+            "records": len(claude_records),
+        },
+        "codex": {
+            "limits": json.loads(cmd_limits(codex_args, codex_records)),
+            "week": json.loads(cmd_week(codex_args, codex_records)),
+            "session": codex_session,
+            "scanned_files": codex_files,
+            "records": len(codex_records),
+        },
+    }, indent=2)
 
 def cmd_live(args, records):
     """Watch loop: refresh every 2s."""
@@ -970,6 +1114,8 @@ def build_parser():
     sub.add_parser("live")
     sub.add_parser("ctx")
     sub.add_parser("limits")
+    sub.add_parser("snapshot")
+    sub.add_parser("capture-limits")
     s = sub.add_parser("session")
     s.add_argument("id", nargs="?", default=None)
     return p
@@ -995,6 +1141,21 @@ def main():
     if cmd == "ctx":
         # Fast path: don't scan everything
         out = cmd_ctx(args)
+        if out:
+            print(out)
+        return
+
+    if cmd == "capture-limits":
+        raise SystemExit(cmd_capture_limits(args))
+
+    if cmd == "snapshot":
+        out = cmd_snapshot(args)
+        if out:
+            print(out)
+        return
+
+    if cmd == "limits" and args.source == "claude":
+        out = cmd_limits(args, [])
         if out:
             print(out)
         return
