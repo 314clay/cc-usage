@@ -26,6 +26,9 @@ CLAUDE_LIMITS_CACHE = HOME / ".cache" / "cc-usage" / "claude-limits.json"
 # Keyed as "<provider>/<family>". For OpenAI we don't get a separate
 # cache-write rate, so cache_write == input.
 PRICING = {
+    # fable: 5m cache-write rate (12.50); 1h writes bill at 20.00 and are not
+    # distinguished in the transcript usage block, so long-cache runs undercount.
+    "claude/fable":  (10.00, 50.00, 12.50, 1.00),
     "claude/opus":   (15.00, 75.00, 18.75, 1.50),
     "claude/sonnet": (3.00, 15.00, 3.75, 0.30),
     "claude/haiku":  (1.00, 5.00, 1.25, 0.10),
